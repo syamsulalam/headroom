@@ -8,9 +8,11 @@ See: https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_windo
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 import os
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,27 +21,35 @@ from headroom.pricing.litellm_model_resolution import (
     resolve_litellm_model_name,
 )
 
-# litellm calls `dotenv.load_dotenv()` during its own import, which loads
-# the project `.env` into `os.environ`. We don't want that side effect —
-# importing a pricing helper should not silently leak API keys into the
-# process. Snapshot `os.environ` around the import and undo any keys
-# litellm added. The module itself is fully imported and cached in
-# `sys.modules`; subsequent `import litellm` calls hit the cache and
-# don't re-run the dotenv side effect.
-try:
-    import os as _os
+LITELLM_AVAILABLE = importlib.util.find_spec("litellm") is not None
+litellm: Any | None = None
+_litellm_lock = threading.Lock()
 
-    _env_snapshot = set(_os.environ)
-    import litellm
 
-    for _leaked_key in set(_os.environ) - _env_snapshot:
-        del _os.environ[_leaked_key]
-    del _env_snapshot, _os
-
-    LITELLM_AVAILABLE = True
-except ImportError:
-    litellm = None  # type: ignore[assignment]
-    LITELLM_AVAILABLE = False
+def _get_litellm_module() -> Any | None:
+    """Load pricing only on first use; provider registration needs no price DB."""
+    global litellm, LITELLM_AVAILABLE
+    if not LITELLM_AVAILABLE:
+        return None
+    if litellm is not None:
+        return litellm
+    with _litellm_lock:
+        if litellm is not None:
+            return litellm
+        # LiteLLM loads .env during import. Undo keys introduced by that import.
+        environment_before = set(os.environ)
+        try:
+            import litellm as imported_litellm
+        except ImportError:
+            LITELLM_AVAILABLE = False
+            return None
+        finally:
+            for key in set(os.environ) - environment_before:
+                del os.environ[key]
+        litellm = imported_litellm
+        _register_minimax_pricing()
+        _inject_deepseek_pricing()
+        return litellm
 
 _resolved_model_cache: dict[str, str] = {}
 
@@ -72,7 +82,7 @@ def _static_alias_map() -> dict[str, str]:
 
 def _reduce_to_priced_key(target: str) -> str | None:
     """Reduce a gateway target to a priced litellm.model_cost key, or None."""
-    if not LITELLM_AVAILABLE or litellm is None:
+    if _get_litellm_module() is None:
         return None
     candidates = [target]
     for prefix in _GATEWAY_PROVIDER_PREFIXES:
@@ -108,7 +118,7 @@ def resolve_litellm_model(model: str) -> str:
 
 def _resolve_litellm_model_uncached(model: str) -> str:
     """Uncached resolution — called once per unique model name."""
-    if not LITELLM_AVAILABLE:
+    if _get_litellm_module() is None:
         return model
 
     def is_known_model(candidate: str) -> bool:
@@ -142,9 +152,6 @@ def _register_minimax_pricing() -> None:
         litellm.model_cost["MiniMax-M3"] = dict(litellm.model_cost[source_key])
 
 
-_register_minimax_pricing()
-
-
 @dataclass
 class LiteLLMModelPricing:
     """Pricing information from LiteLLM's database.
@@ -176,7 +183,7 @@ def get_litellm_model_cost() -> dict[str, Any]:
         Dictionary mapping model names to their pricing/capability info.
         Empty dict if litellm is not installed.
     """
-    if not LITELLM_AVAILABLE:
+    if _get_litellm_module() is None:
         return {}
     return litellm.model_cost  # type: ignore[no-any-return]
 
@@ -190,7 +197,7 @@ def get_model_pricing(model: str) -> LiteLLMModelPricing | None:
     Returns:
         LiteLLMModelPricing if found, None if not found or litellm not installed.
     """
-    if not LITELLM_AVAILABLE:
+    if _get_litellm_module() is None:
         return None
     cost_data = litellm.model_cost
 
@@ -305,7 +312,7 @@ def estimate_cost_from_tokens(
     ``python_version < '3.14'``) or doesn't know the model -- the caller's cue
     to fall back to its own table.
     """
-    if not LITELLM_AVAILABLE:
+    if _get_litellm_module() is None:
         return None
     candidate = next((c for c in pricing_lookup_candidates(model) if c in litellm.model_cost), None)
     if candidate is None:
@@ -329,7 +336,7 @@ def list_available_models() -> list[str]:
     Returns:
         List of model names. Empty list if litellm not installed.
     """
-    if not LITELLM_AVAILABLE:
+    if _get_litellm_module() is None:
         return []
     return list(litellm.model_cost.keys())
 
@@ -374,7 +381,7 @@ def _inject_deepseek_pricing() -> None:
     are added so resolve_litellm_model() catches them via its deepseek/
     prefix loop.
     """
-    if not LITELLM_AVAILABLE:
+    if not LITELLM_AVAILABLE or litellm is None:
         return
     for model_name, pricing in _DEEPSEEK_V4_PRICING.items():
         if model_name not in litellm.model_cost:
@@ -382,6 +389,3 @@ def _inject_deepseek_pricing() -> None:
         prefixed = f"deepseek/{model_name}"
         if prefixed not in litellm.model_cost:
             litellm.model_cost[prefixed] = pricing
-
-
-_inject_deepseek_pricing()

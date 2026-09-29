@@ -1795,25 +1795,6 @@ class HeadroomProxy(
                     eager_status.setdefault(key, value)
                 transform_statuses.append(transform_status)
 
-        # LiteLLM's pricing tables. MEASURED 2.9-3.8s to import, and it was
-        # being imported lazily ON THE EVENT LOOP during the first request:
-        # emit_request_outcome -> record_request -> _estimate_compression_savings_usd
-        # calls it before its own `tokens_saved <= 0` early return, so even a
-        # request that saved nothing pays for it. Nothing about that is visible
-        # as a failure; it just makes one unlucky user wait ~3s.
-        #
-        # This function already runs under asyncio.to_thread, so importing here
-        # cannot delay the port bind.
-        try:
-            from .savings_tracker import _get_litellm_module
-
-            eager_status.setdefault(
-                "litellm", "ready" if _get_litellm_module() is not None else "not installed"
-            )
-        except Exception as exc:  # pricing is optional; never block startup on it
-            logger.debug("LiteLLM pre-load skipped: %s", exc)
-            eager_status.setdefault("litellm", "skipped")
-
         return eager_status, transform_statuses
 
     async def startup(self):
@@ -2091,6 +2072,19 @@ class HeadroomProxy(
                 "warmup": self.warmup.to_dict(),
             },
         )
+        if self.config.cost_tracking_enabled:
+            # Pricing is optional and its import took 8.9s on a Windows Codex
+            # cold start. Warm it after lifespan startup so /readyz can bind;
+            # a request arriving sooner still waits on Python's import lock.
+            def warm_pricing() -> None:
+                try:
+                    from .savings_tracker import _get_litellm_module
+
+                    _get_litellm_module()
+                except Exception as exc:
+                    logger.debug("LiteLLM pricing warmup skipped: %s", exc)
+
+            threading.Thread(target=warm_pricing, name="headroom-pricing-warmup", daemon=True).start()
 
     async def shutdown(self):
         """Cleanup async resources."""

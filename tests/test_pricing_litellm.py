@@ -1,8 +1,29 @@
 from __future__ import annotations
 
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 from headroom.pricing import litellm_pricing
+
+
+def test_importing_pricing_does_not_load_litellm() -> None:
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import headroom.pricing.litellm_pricing; "
+            "assert 'litellm' not in sys.modules",
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_litellm_helpers_when_dependency_is_unavailable(monkeypatch) -> None:

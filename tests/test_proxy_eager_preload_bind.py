@@ -91,15 +91,36 @@ def test_eager_preload_dedupes_and_swallows_failures():
 
     eager_status, statuses = proxy._eager_preload_transforms()
 
-    # Keys the preload contributes itself rather than collecting from a
-    # transform, so this assertion stays about dedupe/swallowing.
-    non_transform_keys = {"litellm"}
-    assert {k: v for k, v in eager_status.items() if k not in non_transform_keys} == {
+    assert eager_status == {
         "shared": "enabled",
         "kompress": "enabled",
     }
     assert statuses == [{"shared": "enabled"}, {"kompress": "enabled"}]
-    assert eager_status["litellm"] in {"ready", "not installed", "skipped"}
+
+
+async def test_optional_pricing_warmup_does_not_block_readiness(monkeypatch):
+    from headroom.proxy import savings_tracker
+
+    proxy = _make_proxy(optimize=True)
+    proxy.config.cost_tracking_enabled = True
+    proxy.anthropic_pipeline = _FakePipeline([])
+    proxy.openai_pipeline = _FakePipeline([])
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_pricing_import():
+        entered.set()
+        release.wait(timeout=5)
+
+    monkeypatch.setattr(savings_tracker, "_get_litellm_module", slow_pricing_import)
+    try:
+        start = time.monotonic()
+        await proxy.startup()
+        assert time.monotonic() - start < 2
+        assert entered.wait(timeout=2)
+    finally:
+        release.set()
+        await proxy.shutdown()
 
 
 async def test_startup_binds_despite_hung_preload(monkeypatch):
